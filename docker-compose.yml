@@ -6,6 +6,11 @@ services:
     build:
       context: ./retrieval
     container_name: retrieval_service
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 512M
     env_file:
       - .env  # default; overridden by test/prod
     ports:
