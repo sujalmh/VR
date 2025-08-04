@@ -26,7 +26,6 @@ jobs:
             git pull origin dev
             fuser -k 8060/tcp || true
 
-            cd retrieval
             source venv/bin/activate
             pip install -r requirements.txt
             nohup uvicorn cpi_top5_results_v5_vm_experimental_citeurl:app --host 0.0.0.0 --port 8060 > retrieval.log 2>&1 &
