@@ -1,0 +1,14 @@
+# docker-compose.yml
+version: "3.9"
+
+services:
+  retrieval:
+    build:
+      context: ./retrieval
+    container_name: retrieval_service
+    env_file:
+      - .env  # default; overridden by test/prod
+    ports:
+      - "${PORT}:8000"
+    command: >
+      sh -c "uvicorn ${MODULE}:app --host 0.0.0.0 --port 8000"
