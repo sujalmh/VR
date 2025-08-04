@@ -4,7 +4,7 @@ version: "3.9"
 services:
   retrieval:
     build:
-      context: ./retrieval
+      context: .
     container_name: retrieval_service
     deploy:
       resources:
