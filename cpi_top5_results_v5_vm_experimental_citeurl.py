@@ -51,7 +51,7 @@ logging.basicConfig(
 
 # API Key verification dependency
 async def verify_api_key(api_key: str = Depends(api_key_header)):
-    logging.info(f"Received API Key: {api_key[:4]}****")  # Mask API key for security
+    logging.info(f"Received API Key: {api_key[:4]}****")
     if api_key != os.getenv("ACQ_API_KEY"):
         logging.warning(f"Unauthorized API access attempt with key: {api_key[:4]}****")
         raise HTTPException(status_code=403, detail="Invalid API Key")
