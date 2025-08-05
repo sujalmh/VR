@@ -9,7 +9,9 @@ cd /mnt/data/sujalmh/vr
 git pull origin $ENV
 
 # Kill existing container if running
-docker compose -f docker-compose.yml -f docker-compose.override.${ENV}.yml down || true
+PORT=$PORT MODULE=$MODULE docker compose \
+  -f docker-compose.yml -f docker-compose.override.${ENV}.yml down || true
 
-# Build and run only retrieval service
-docker compose -f docker-compose.yml -f docker-compose.override.${ENV}.yml up -d --build retrieval
+PORT=$PORT MODULE=$MODULE docker compose \
+  -f docker-compose.yml -f docker-compose.override.${ENV}.yml \
+  up -d --build retrieval
