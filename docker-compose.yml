@@ -7,7 +7,7 @@ services:
       resources:
         limits:
           cpus: '2.0'
-          memory: 512M
+          memory: 2g
     env_file:
       - .env  # default; overridden by test/prod
     ports:
