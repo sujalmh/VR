@@ -5,7 +5,7 @@ from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel
 from encoder import emb_text, model
-from milvus_utils_crossencoder_v5 import get_milvus_client, get_search_results, get_chunks_by_reference_page_pairs
+from milvus_utils_crossencoder_v6 import get_milvus_client, get_search_results, get_chunks_by_reference_page_pairs
 import os
 from dotenv import load_dotenv
 from sentence_transformers import CrossEncoder
@@ -18,7 +18,8 @@ from time import strftime, gmtime
 import re
 from typing import List, Dict
 from math import ceil
-from collections import defaultdict
+import ast
+import numpy as np
 # Load environment variables
 load_dotenv()
 
@@ -30,10 +31,10 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 current_date = datetime.now().strftime('%Y-%m-%d')
 
 # FastAPI instance
-app = FastAPI(title="Version 5 Server for Top Vector Search Results")
+app = FastAPI(title="Version 6 Server for Top Vector Search Results")
 
 # Milvus Configuration
-CPI_V5_COLLECTION_NAME = os.getenv("CPI_V5_COLLECTION_NAME")
+CPI_V6_COLLECTION_NAME = os.getenv("CPI_V6_COLLECTION_NAME")
 MILVUS_ENDPOINT = os.getenv("MILVUS_ENDPOINT")
 MILVUS_TOKEN = os.getenv("MILVUS_TOKEN")
 TOP_N_RESULTS = 5  # Configurable number of search results
@@ -47,7 +48,7 @@ milvus_client = get_milvus_client(uri=MILVUS_ENDPOINT, token=MILVUS_TOKEN)
 
 # Logging setup
 logging.basicConfig(
-    filename="cpi-v5-"+current_date+".log",  # Log file name
+    filename="cpi-v6-"+current_date+".log",  # Log file name
     level=logging.DEBUG,
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
@@ -73,7 +74,7 @@ def clarify_query(query):
     response = client.models.generate_content(
         model="gemini-2.0-flash",
         config=types.GenerateContentConfig(
-            system_instruction=dedent(f"""You are tasked with rephrasing the given query to make it easier for a RAG agent to pull the right data. 
+            system_instruction=dedent(f"""You are tasked with rephrasing the given query to make it easier for a RAG agent to pull the right data.
                 Rules to produce rephrased query:
                     1. Do not edit the query as far as possible, only augment with a date range if none is present.
                         a. Remember that the current date is {curdate}.
@@ -95,8 +96,9 @@ def clarify_query(query):
                         Example: "Top 5 states by GDP" -> "Top 5 states by GDP, GVA, GSVA, GSDP, NSDP"
                         Example: "Contribution of agriculture to Madhya Pradesh economy" -> "Madhya Pradesh economy, Madhya Pradesh Agriculture, Madhya Pradesh GSDP"
                         Example: "Inflation in India" -> "Inflation in India, categories such as food and beverages, clothing, wholesale prices"
-                    7. You MUST restrict your output to at most 25 words.
-                    
+                    7. You MUST attach a minimum and maximum date to the output.
+                    8. You MUST restrict your output to at most 25 words.
+
             The original query is given below.
             """),
             tools=[google_search_tool],
@@ -146,41 +148,33 @@ def final_query(query):
 
     return response.text
 
-"""
-def clarify_query(query):
-    client = genai.Client(api_key=GOOGLE_API_KEY)
-    curdate = strftime("%Y-%m", gmtime())
-    google_search_tool = Tool(
-        google_search = GoogleSearch()
-    )
-    response = client.models.generate_content(
-        model="gemini-2.0-flash",
-        config=types.GenerateContentConfig(
-            system_instruction=dedent(fYou are tasked with rephrasing the given query to make it easier for a vector agent to pull the right data. ONLY IF NECESSARY, generate a rephrased natural language version of the query keeping in mind the following steps:
-            1. Analyze the provided query for key entities. For example, if the query is about inflation in vegetables which is a type of food, then include the phrase "inflation in vegetables which is a type of food".
-            2. Extract key phrases from the query and rewrite them with emphasis. For example, if the query asks about "state-level growth", rewrite it to "STATE LEVEL GROWTH (GDP)".
-            3. Analyze the query for the existence of dates or time-related phrases.
-                a. For example, if the query asks about GDP growth since December 2024, rephrase it as "GDP growth from [December 2024] to [{curdate}]".
-                b. For example, if the query asks about IIP in the last six months, compute the date six months BEFORE [{curdate}] and add this information to the query.
-                c. If the query asks about the last quarter, compute the last full quarter BEFORE [{curdate}] and add this information to the query.
-                d. If the query asks about vague timelines such as "long term" without specifying dates, use the date five years ago from [{curdate}].
-                e. IMPORTANT: If no date exists in the query use a range from 6 months before [{curdate}] to [{curdate}].
-                f. If the query contains an event without a date (for example, "COVID" or "51st meeting" or "the last world cup"), then use the google_search_tool to attach a date to the event.
-                VERY IMPORTANT: DO NOT use the web search to add any extraneous information to the query, apart from the extracted date.
-                g. If the date is after [{curdate}], use [{curdate}] instead.
-            4. If there are any numeric counters such as 1st, 2nd, 3rd, rewrite it in words. For example, 51st should be rewritten as "fifty first".
-            5. Always remember that all queries are related to India. If the word "India" is not mentioned in the query, include this in the rephrased query.
-            6. Do not include your reasoning trace in the rephrased query. Your output should contain only the information that is required from the Vector database.
-            7. You MUST restrict your output to at most 25 words.
-            
-            tools=[google_search_tool],
-            temperature=0.0,
-            ),
-        contents=query
-    )
-
-    return response.text
-"""
+def identify_lexical_term(query):
+    try:
+        client = genai.Client(api_key=GOOGLE_API_KEY)
+        response = client.models.generate_content(
+            model="gemini-2.0-flash",
+            config=types.GenerateContentConfig(
+                system_instruction=dedent("""Extract a MAXIMUM of FOUR (4) key entity /entities from the statement below, which can be used for lexical matching in proposed answers. It/they should be state names, categories of product, macro-economic indicators (GDP, GVA, etc.), or sectors (agriculture, mining, etc.). 
+                                          
+                IMPORTANT: They should be terms that are the "answer" in the text provided below. 
+                For example, "**NSDP:** Karnataka has the highest per capita NSDP." --> ['Karnataka']
+                
+                IMPORTANT: Look phrases similar containing the word "of", and use the predicates in your list.
+                For example, "Impact of startups" --> ["startups"]
+                For example, "Economy of Uttar Pradesh" --> ["Uttar Pradesh"]
+                                          
+                DO NOT return any other thinking trace apart from your answer(s) as a list [term1, term2]
+                """),
+                temperature=0.0,
+                ),
+            contents=query
+        )
+        response = ast.literal_eval(response.text)
+        logging.info("Identified key terms: " + str(response))
+        return response
+    except:
+        return []
+    return []
 
 def fetch_date(query):
     client = genai.Client(api_key=GOOGLE_API_KEY)
@@ -360,7 +354,8 @@ def get_reference_url(ref: str, source: str = '') -> str:
     base_minutes_url = 'https://website.rbi.org.in/documents/87730/39710918/'
     base_mospi_url = 'https://www.mospi.gov.in/sites/default/files/press_release/'
     base_eco_survey_url = 'https://www.indiabudget.gov.in/budget2024-25/economicsurvey/doc/'
-    
+    base_pib_url = 'https://www.pib.gov.in/PressReleasePage.aspx?PRID='
+
     if re.match(r"Inflation Expectations Survey of Households \w+ \d{4}", ref):
         if source and source.endswith('.pdf'):
             return f'{base_rbi_docs_url}{source.replace(" ", "+")}'
@@ -381,11 +376,23 @@ def get_reference_url(ref: str, source: str = '') -> str:
             return f'{base_mospi_url}{source.replace(" ", "+")}'
         else:
             return "https://www.mospi.gov.in/archive/press-release?field_press_release_category_tid=120"
-    elif re.match(r"Economic Survey \d{4} ?- ?\d{4}", ref):
-        if source and source.endswith('.pdf'):
-            return f'{base_eco_survey_url}{source.replace(" ", "+")}'
-        else:
-            return "https://www.indiabudget.gov.in/economicsurvey/allpes.php"
+    elif re.match(r"Economic Survey(?: \w+)? (\d{4})[-–](\d{2,4})", ref):
+        match = re.match(r"Economic Survey(?: \w+)? (\d{4})[-–](\d{2,4})", ref)
+        if match:
+            start_year = int(match.group(1))
+            end_year = int(match.group(2))
+            
+            # Normalize 2-digit year like '24' to 2024
+            if end_year < 100:
+                end_year += 2000
+            
+            # Special case: Economic Survey 2024–2025 goes to a different URL
+            if start_year == 2024 and end_year == 2025:
+                return "https://www.indiabudget.gov.in/economicsurvey/doc/echapter.pdf"
+            
+            # Construct URL from end_year
+            budget_year = f'budget{end_year}-{(end_year + 1)%100:02d}'
+            return f'https://www.indiabudget.gov.in/{budget_year}/economicsurvey/doc/echapter.pdf'
     elif re.match(r"IIP Press Release \w+ \d{4}", ref):
         if source and source.endswith('.pdf'):
             return f'{base_mospi_url}{source.replace(" ", "+")}'
@@ -543,7 +550,12 @@ def get_reference_url(ref: str, source: str = '') -> str:
     elif re.match(r"Master Circular(s)?( –|-)? (on )?.+ \w+ \d{1,2}, \d{4}", ref, re.IGNORECASE):
         return "https://rbi.org.in/Scripts/BS_ViewMasterCirculardetails.aspx"
     elif re.match(r".+ -? ?PIB \d{1,2} \w+ \d{4}", ref, re.IGNORECASE):
-        return "https://pib.gov.in/PressReleseDetail.aspx?PRID=2089308&reg=3&lang=1"
+        match = re.search(r'PIB(\d+)', source)
+        if match:
+            prid = match.group(1)
+            return f'{base_pib_url}{prid}'
+        else:
+            return "https://pib.gov.in/"
     elif re.match(r"MSME ANNUAL REPORT( \d{4}-\d{2})?$", ref, re.IGNORECASE):
         return "https://www.msme.gov.in/relatedlinks/annual-report-ministry-micro-small-and-medium-enterprises"
     elif re.match(r"Ministry Wise Procurement \d{4}-\d{2}", ref):
@@ -565,6 +577,122 @@ def get_reference_url(ref: str, source: str = '') -> str:
         return "https://documents1.worldbank.org/curated/en/504361583989615623/pdf/Malaysia-s-Experience-with-the-Small-and-Medium-Sized-Enterprises-Masterplan-Lessons-Learned.pdf"
     elif re.match(r"Malaysian SME Program Efficiency Review \w+ \d{4}", ref, re.IGNORECASE):
         return "https://documents1.worldbank.org/curated/en/099255003152238688/pdf/P17014606709a70f50856d0799328fb7040.pdf"
+    elif re.match(r"Budget Speech \d{4} ?- ?\d{4}", ref):
+        if source and source.endswith('.pdf'):
+            return f'https://www.indiabudget.gov.in/doc/bspeech/{source.replace(" ", "+")}'
+        else:
+            return 'https://www.indiabudget.gov.in/budget_archive.php'
+    elif re.match(r"Budget Highlights \w+ \d{4}", ref):
+        match = re.match(r"Budget Highlights (\w+) (\d{4})", ref)
+        if match:
+            month, year = match.groups()
+            year = int(year)
+
+            if month.lower() == 'february':
+                if year >= 2024:
+                    return 'https://www.indiabudget.gov.in/doc/bh1.pdf'
+                else:
+                    next_year = year + 1
+                    return f'https://www.indiabudget.gov.in/budget{next_year}-{(next_year)%100:02d}/doc/bh1.pdf'
+
+            elif month.lower() == 'july':
+                return 'https://www.indiabudget.gov.in/budget2024-25/doc/bh1.pdf'
+
+        # Fallback
+        return 'https://www.indiabudget.gov.in/'
+    elif re.match(r"Memorandum Explaining the Provisions in the Financial Bill January \d{4}", ref):
+        match = re.match(r".*January (\d{4})", ref)
+        if match:
+            year = int(match.group(1))
+
+            if year >= 2025:
+                return 'https://www.indiabudget.gov.in/doc/memo.pdf'
+            else:
+                next_year = year + 1
+                return f'https://www.indiabudget.gov.in/budget{next_year}-{(next_year)%100:02d}/doc/memo.pdf'
+
+        return 'https://www.indiabudget.gov.in/'  # fallback
+
+    elif re.match(r"Finance Bill February \d{4}", ref):
+        match = re.match(r"Finance Bill February (\d{4})", ref)
+        if match:
+            year = int(match.group(1))
+
+            if year >= 2025:
+                return 'https://www.indiabudget.gov.in/doc/Finance_Bill.pdf'
+            else:
+                next_year = year + 1
+                return f'https://www.indiabudget.gov.in/budget{next_year}-{(next_year)%100:02d}/doc/Finance_Bill.pdf'
+
+        return 'https://www.indiabudget.gov.in/'  # fallback
+
+    elif re.match(r"Key to Budget Document January \d{4}", ref):
+        if source and source.endswith('.pdf'):
+            return f'https://www.indiabudget.gov.in/doc/{source.replace(" ", "+")}'
+        else:
+            return 'https://www.indiabudget.gov.in/'
+
+    elif re.match(r"Statements of Fiscal Policy under the FRBM Act \w+ \d{4}", ref):
+        match = re.match(r"Statements of Fiscal Policy under the FRBM Act \w+ (\d{4})", ref)
+        if match:
+            year = int(match.group(1))
+            if year >= 2025:
+                return 'https://www.indiabudget.gov.in/doc/frbm1.pdf'
+            else:
+                next_year = year + 1
+                return f'https://www.indiabudget.gov.in/budget{next_year}-{next_year % 100:02d}/doc/frbm1.pdf'
+        return 'https://www.indiabudget.gov.in/'  
+    elif re.match(r"Outcome Budget \w+ \d{4}", ref):
+        match = re.match(r"Outcome Budget \w+ (\d{4})", ref)
+        if match:
+            year = int(match.group(1))
+            next_year = year + 1
+            file_name = f'OutcomeBudgetE{year}_{next_year}.pdf'
+            if year >= 2025:
+                return f'https://www.indiabudget.gov.in/doc/{file_name}'
+            else:
+                return f'https://www.indiabudget.gov.in/budget{year+1}-{str(next_year)[-2:]}/doc/{file_name}'
+        return 'https://www.indiabudget.gov.in/'  # fallback
+    elif re.match(r"Budget At A Glance January \d{4}", ref):
+        match = re.match(r"Budget At A Glance January (\d{4})", ref)
+        if match:
+            year = int(match.group(1))
+            next_year = year + 1
+            if year >= 2025:
+                return 'https://www.indiabudget.gov.in/doc/Budget_at_Glance/budget_at_a_glance.pdf'
+            else:
+                return f'https://www.indiabudget.gov.in/budget{next_year}-{str(next_year)[-2:]}/doc/Budget_at_Glance/budget_at_a_glance.pdf'
+        return 'https://www.indiabudget.gov.in/'  # fallback
+    elif ref.startswith('Accounts At A Glance'):
+        match = re.match(r'Accounts At A Glance (\d{4})-(\d{2})', ref)
+        if match:
+            year = int(match.group(1))
+            ref_urls = {
+                2022: 'https://cga.nic.in//writereaddata/file/Accounts%20at%20a%20Glance%202022-23%20(English)%20-%20Final.pdf',
+                2021: 'https://cga.nic.in//writereaddata/file/AccountsataGlance2021_2022.pdf',
+                2020: 'https://cga.nic.in//writereaddata/file/AccountsAtaGlance2020-21English.pdf',
+                2019: 'https://cga.nic.in//writereaddata/file/AccountsataGlance2019_2020.pdf',
+            }
+            return ref_urls.get(year, 'https://cga.nic.in/')
+        return 'https://cga.nic.in/'  # fallback
+    elif ref.startswith('GFSM Yearly'):
+        match = re.match(r'GFSM Yearly (\d{4}-\d{2})', ref)
+        if match:
+            year_range = match.group(1)
+            return f'https://cga.nic.in//writereaddata/file/gfsm/FY-{year_range}.pdf'
+    elif ref.startswith('GFSM Quater'):
+        match = re.match(r'GFSM Quater (\d) (\d{4}-\d{2})', ref)
+        if match:
+            quarter = match.group(1)
+            year_range = match.group(2)
+            # Try to find the filename from the source if provided
+            if source and source.endswith('.pdf'):
+                return f'https://cga.nic.in//writereaddata/file/{source}'
+            else:
+                # Default fallback (not always reliable)
+                filename_guess = f'Q{quarter} {year_range}.pdf'
+                return f'https://cga.nic.in//writereaddata/file/{filename_guess}'
+
     else:
         return "Unknown Url"  # Default empty if no match
 
@@ -628,7 +756,7 @@ async def search_topN_milvus(request: Request, question: Question):
     bin_size   =  2
     top_k      =  6
     min_months =  3
-    
+
     start_time = time.time()
     request_time = datetime.utcnow().isoformat()
 
@@ -656,14 +784,15 @@ async def search_topN_milvus(request: Request, question: Question):
         query_duration = min_months
     min_date = datetime.strptime(query_min_date, "%B %Y")
     max_date = datetime.strptime(query_date, "%B %Y")
-    
+
     client_ip = request.client.host  # Get client IP address
 
     logging.info(f"Received request from {client_ip} at {request_time}")
     logging.info(f"Question Asked: {question.question}")
     logging.info(f"LLM Query Generated: {llm_query}")
     logging.info("Reference answer: " + suggest_answer)
-    
+    key_terms = identify_lexical_term(suggest_answer)
+
     if query_duration <= min_months:
         date_range = [(min_date, max_date), (max_date + relativedelta(months=1), max_date + relativedelta(months=min_months))]
     else:
@@ -675,8 +804,10 @@ async def search_topN_milvus(request: Request, question: Question):
             next_chunk = min(cur_date + relativedelta(months=step), max_date)
             date_range.append((cur_date, next_chunk))
             cur_date = next_chunk + relativedelta(months=1)
-        date_range.append((max_date + relativedelta(months=1), max_date + relativedelta(months=step)))
-        bin_size += 1
+        date_range.append((max_date - relativedelta(months=2), max_date + relativedelta(months=2)))
+        if (step > 3) and (query_duration >= 18):
+            date_range.append((max_date + relativedelta(months=3), max_date + relativedelta(months=step)))
+    bin_size = len(date_range)
 
     logging.info(
         f"""Overall date_filter: Min Date: {min_date.strftime("%B %Y")}, Max Date: {max_date.strftime("%B %Y")}, Total Months: {query_duration}"""
@@ -698,10 +829,13 @@ async def search_topN_milvus(request: Request, question: Question):
         embed_time = time.time() - embed_start
 
         logging.info(f"Embedding generation time: {embed_time:.4f} seconds")
-        
+
         total_search_time = 0.0
         top_results_to_return = []
-        
+
+        used_buckets = []
+        used_indices = []
+
         for start_date, end_date in date_range:
             chunk_label = f"{start_date.strftime('%B %Y')} to {end_date.strftime('%B %Y')}"
             logging.info(f"Processing range: {chunk_label}")
@@ -715,7 +849,7 @@ async def search_topN_milvus(request: Request, question: Question):
             # Search in Milvus
             search_start = time.time()
             search_res = get_search_results(
-                milvus_client, CPI_V5_COLLECTION_NAME, query_vector, ["content", "source", "id", "page", "reference", "date"],
+                milvus_client, CPI_V6_COLLECTION_NAME, query_vector, ["content", "source", "id", "page", "reference", "date"],
                 milvus_date_filter, bin_size
             )
             search_time = time.time() - search_start
@@ -731,6 +865,7 @@ async def search_topN_milvus(request: Request, question: Question):
             # Retrieve the top results
             top_results = [
                 {
+                    "id": result["id"],
                     "content": result["entity"]["content"],
                     "distance": result["distance"],
                     "source": result["entity"]["source"],
@@ -754,63 +889,117 @@ async def search_topN_milvus(request: Request, question: Question):
             #pairs = [(llm_query, str(item["content"]) + "\n\nResult from " + str(item["reference"]) + ", " + str(item['date'])) for item in top_results]
             pairs = [(llm_query + "\n" + suggest_answer, str(item["content"]) + "\n\nResult from " + str(item["reference"]) + ", " + str(item['date'])) for item in top_results]
             scores = cross_encoder.predict(pairs)
-            logging.info("Scores:")
-            logging.info(str(scores))
-            if True:
-                try:
-                    logging.info("Attempting chunk addition")
-                    
-                    # 1. Find items in top_results with score >= 0
-                    candidates = [
-                        (item, score)
-                        for item, score in zip(top_results, scores)
-                        if score >= 0
-                    ]
+            counts = []
+            for item in top_results:
+                count = sum(term in str(item['content']) for term in key_terms)
+                counts.append(count)
+            counts = np.array(counts).astype(float)
+            counts -= 0.25*len(key_terms)
+            scores += counts
+            penalty = np.array([10*(item['content'].count("\n")+item['content'].count("|"))/len(item['content']) for item in top_results])
+            scores -= penalty
+            scores = np.round(1 / (1 + np.exp(-scores)),decimals=3)
+            logging.info("Scores: " + str(scores))
+            logging.info("Lexical boosts: " + str(counts))
+            logging.info("Noise penalty : " + str(penalty))
+            try:
+                logging.info("Attempting chunk addition")
 
-                    if candidates:
+                # 1. Find items in top_results with score >= 0.5 after normalization
+                candidates = [
+                    (item, score)
+                    for item, score in zip(top_results, scores)
+                    if score >= 0.5
+                ]
 
-                        # 2. Generate [reference, page]—also including one page before and after
-                        for item, _, in candidates:
-                            reference = item["reference"]
-                            page = int(item["page"])
-                            # Assuming 'page' is an integer
-                            group_content = ""
-                            for p in [page - 1, page, page + 1]:
-                                new_search = []
-                                new_search.append([reference, str(p)])
+                if candidates:
+
+                    # 2. Generate [reference, page]—also including one page before and after
+
+                    for item, _, in candidates:
+                        reference  = item["reference"]
+                        page       = int(item["page"])
+                        current_id = int(item["id"])
+                        #logging.info("Found current id " + str(current_id))
+                        # Assuming 'page' is an integer
+                        group_content = ""
+                        new_search = []
+                        for p in [page - 1, page, page + 1]:
+                            new_search.append([reference, str(p)])
+
+                        # 3. Retrieve all matching chunks
+                        add_result = get_chunks_by_reference_page_pairs(
+                            milvus_client,
+                            CPI_V6_COLLECTION_NAME,
+                            new_search
+                        )
+                        
+                        id_list    = [int(item["id"]) for item in add_result]
+                        #logging.info("Found id list " + str(id_list))
+                        secn_start = [1 if "[SECTION]" in item['content'] else 0 for item in add_result]
+                        #logging.info("Sections start at " + str(secn_start))
+                        pos        = id_list.index(current_id)
+                        #logging.info("Found current section at " + str(pos))
+                        
+                        before = None
+                        for i in range(pos, -1, -1):
+                            if secn_start[i] == 1:
+                                before = i
+                                break
+                        if before is None:
+                            before = max(0,pos - 1)
                             
-                                # 3. Retrieve all matching chunks
-                                add_result = get_chunks_by_reference_page_pairs(
-                                    milvus_client,
-                                    CPI_V5_COLLECTION_NAME,
-                                    new_search
-                                )
-                                if not (not add_result or not add_result[0]):
-                                    if p == page - 1:
-                                        group_content += add_result[-1]['content']
-                                    if p == page + 1:
-                                        group_content += add_result[0]['content']
-                                    if p == page:
-                                        for item_inner in add_result:
-                                            group_content += item_inner['content'] + "\n"
+                        after = None
+                        for i in range(pos+1, len(secn_start)):
+                            if secn_start[i] == 1:
+                                after = i
+                                break
+                        if after is None:
+                            after = len(secn_start)
+
+                        if [before, after] not in used_buckets:
+                            used_buckets.append([before, after])
+                            #logging.info("Collating between " + str([before, after]))
+                            group_content = ""
+                            for i in range(before, after):
+                                if (len(group_content) < 10000) or (i <= pos):
+                                    group_content += add_result[i]['content']
+                            
                             item['content'] = group_content
-                        n_results = len(top_results)
+                    
+                    """
+                    for item, _, in candidates:
+                        reference = item["reference"]
+                        page = int(item["page"])
+                        # Assuming 'page' is an integer
+                        group_content = ""
+                        for p in [page - 1, page, page + 1]:
+                            new_search = []
+                            new_search.append([reference, str(p)])
 
-                        #pairs = [(llm_query + "\n" + suggest_answer, str(item["content"]) + "\n\nResult from " + str(item["reference"]) + ", " + str(item['date'])) for item in top_results]
-                        #scores = cross_encoder.predict(pairs)
-                        #logging.info("Scores:")
-                        #logging.info(str(scores))
+                            # 3. Retrieve all matching chunks
+                            add_result = get_chunks_by_reference_page_pairs(
+                                milvus_client,
+                                CPI_V6_COLLECTION_NAME,
+                                new_search
+                            )
+                            if not (not add_result or not add_result[0]):
+                                if p == page - 1:
+                                    group_content += add_result[-1]['content']
+                                if p == page + 1:
+                                    group_content += add_result[0]['content']
+                                if p == page:
+                                    for item_inner in add_result:
+                                        group_content += item_inner['content'] + "\n"
+                        item['content'] = group_content[:10000]
+                        """
+                    n_results = len(top_results)
 
-                        # Log Top 15
-                        #logging.info(f"Appending to {n_results} chunks:")
-                        #for i, item in enumerate(top_results, start=1):
-                            #key = (item["reference"], item["page"])
-                            #item['content'] = group_content[key]
-                    else:
-                        logging.info("No qualifying chunks")
+                else:
+                    logging.info("No qualifying chunks")
 
-                except Exception as e:
-                    logging.info("Failed with exception: " + str(e))
+            except Exception as e:
+                logging.info("Failed with exception: " + str(e))
 
             # Let's assume each item in top_15 has a "date" field
             deltas   = [(months_since(item["date"],query_date)) for item in top_results] # Signed deltas, positive = older and negative = newer than query date
@@ -839,39 +1028,40 @@ async def search_topN_milvus(request: Request, question: Question):
                     curtuple = lookup_delta[-1]
                 mindelta = curtuple[0]
                 maxdelta = curtuple[1]
-                    
+
                 chunk_attempt += 1
                 logging.info("Deltas being used: " + str([mindelta,maxdelta]))
                 #logging.info("Computed deltas")
                 #logging.info(deltas)
                 date_boosts = [0 if maxdelta >= deltas[xx] >= mindelta else 25 for xx in range(len(deltas))]
-    
+
                 # Add boosted scores to the cross_encoder scores
                 #logging.info("Original scores: " + str(scores))
                 final_scores = [s - boost for s, boost in zip(scores, date_boosts)]
                 #logging.info("Modified scores: " + str(final_scores))
-    
+
                 # Now rerank based on the final boosted score
                 reranked = sorted(
                 zip(top_results, final_scores, chunk_index),
                 key=lambda x: x[1],
                 reverse=True
                 )
-    
+
                 # Top 5 with cross_score filtering
                 content_concat = []
-                cross_thresh = 0.25 - 0.25*chunk_attempt
+                cross_thresh = 0.5 - 0.1*chunk_attempt
                 for item, score, cur_index in reranked[:top_k]:
-                    item["cross_score"] = float(score)
-                    if (item["cross_score"] > cross_thresh) and (cur_index not in top_index):  # Only include results where cross_score > threshold
+                    item["cross_score"] = np.round(float(score),decimals=3)
+                    if (item["cross_score"] > cross_thresh) and (cur_index not in top_index) and (item["id"] not in used_indices):  # Only include results where cross_score > threshold
                         # Attach the reference URL
                         item["url"] = get_reference_url(item["reference"], item["source"])
                         top_internal.append(item)
                         top_results_to_return.append(item)
                         top_index.append(cur_index)
+                        used_indices.append(item["id"])
                         content_concat += item["content"]
                         #best_relevance = max(best_relevance,item["cross_score"])
-    
+
                 if len(top_internal) < 3:
                     logging.warning("Not enough valid results found in current attempt: (" + str(len(top_internal)) + "/"+str(top_k)+"). Relaxing cross score and deltas ..")
                     #mindelta += 6
@@ -907,9 +1097,16 @@ async def search_topN_milvus(request: Request, question: Question):
             }
         else:
             # Log Top 5
-            n_final = len(top_results_to_return)
+            top_results_to_return.sort(key=lambda item: item["cross_score"], reverse=True)
+            final_return = []
+            char_count   = 0
+            for item in top_results_to_return:
+                if char_count < 40000:
+                    final_return.append(item.copy())
+                    char_count += len(item["content"])
+            n_final = len(final_return)
             logging.info(f"Top {n_final} results after reranking:")
-            for i, res in enumerate(top_results_to_return, start=1):
+            for i, res in enumerate(final_return, start=1):
                 logging.info(
                     f"{i}. Content: {res['content'][:200]}..., Page: {res['page']}, "
                     f"Source: {res['source']}, Reference: {res['reference']}, Date: {item['date']}, Distance: {res['distance']:.4f}, Cross Score: {res['cross_score']:.4f}"
@@ -920,7 +1117,7 @@ async def search_topN_milvus(request: Request, question: Question):
                 "question": question.question,
                 "llm_query": llm_query,
                 "query_date": query_date,
-                "retrieved_results": top_results_to_return,
+                "retrieved_results": final_return,
                 "time": total_time,
             }
 

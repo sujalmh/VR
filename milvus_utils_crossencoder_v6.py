@@ -77,7 +77,7 @@ def get_chunks_by_reference_page_pairs(
         for reference, page in pairs
     ]
     filter_expr = " or ".join(pair_exprs)
-    
+
     # Query the collection using the OR filter
     results = milvus_client.query(
         collection_name=collection_name,
@@ -85,4 +85,3 @@ def get_chunks_by_reference_page_pairs(
         output_fields=output_fields
     )
     return results
-
