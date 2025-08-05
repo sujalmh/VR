@@ -1,21 +1,9 @@
-version: '3.8'
 services:
-  milvus:
-    image: milvusdb/milvus:v2.5.15
-    container_name: milvus
-    ports:
-      - "19530:19530"
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:19530"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
   retrieval:
     build:
       context: .
     container_name: retrieval_service
-    depends_on:
+    networks:
       - milvus
     deploy:
       resources:
@@ -23,7 +11,7 @@ services:
           cpus: '2.0'
           memory: 2g
     env_file:
-      - .env
+      - .env  # default; overridden by test/prod
     ports:
       - "${PORT}:8000"
     command: >
